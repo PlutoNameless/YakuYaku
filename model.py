@@ -2,20 +2,21 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 from torch.nn.modules import ModuleList
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
-
-import copy
-
-# 添加warmup scheduler
 from torch.optim.lr_scheduler import LambdaLR
 
-# 添加Beam Search
-import torch.nn.functional as F
+# Hypothetical Constants and Clones Function
+class Constants:
+    PAD = 0  # This is just an example. You might want to adjust it.
+
+def clones(module, N):
+    return ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
@@ -29,6 +30,8 @@ class Embeddings(nn.Module):
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout, max_len=5000):
         super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
@@ -38,19 +41,23 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
     
     def forward(self, x):
-        pe = self.pe[:,:x.size(1)] 
+        pe = self.pe[:,:x.size(1)]
         x = x + pe
         return self.dropout(x)
 
 def attention(query, key, value, mask=None, dropout=None):
     d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) \
-             / math.sqrt(d_k)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    p_attn = F.softmax(scores, dim = -1)
+        mask = mask.bool()  # Ensure the mask is boolean
+        scores.masked_fill_(~mask, -1e9)
+        
+    p_attn = F.softmax(scores, dim=-1)
+    
     if dropout is not None:
         p_attn = dropout(p_attn)
+        
     return torch.matmul(p_attn, value), p_attn
 
 class MultiHeadAttention(nn.Module):
@@ -126,9 +133,9 @@ class Encoder(nn.Module):
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
         self.lstm = nn.LSTM(layer.size, layer.size, bidirectional=True, batch_first=True)
-        self.layers = ModuleList([copy.deepcopy(layer) for _ in range(N)])
-        self.norm = LayerNorm(layer.size) 
-        
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size * 2)  # Adjusted for bidirectional LSTM
+
     def forward(self, x, mask):
         x, _ = self.lstm(x)
         for layer in self.layers:
@@ -200,12 +207,12 @@ class Transformer(nn.Module):
     
     # 添加Beam Search
     def beam_search(self, src, src_mask, max_len, start_symbol, 
-               beam_size=5, alpha=0.6, beta=0.6):
+                    beam_size=5, alpha=0.6, beta=0.6):
 
         memory = self.encode(src, src_mask)
         
-        # 初始化beam
-        candidates = [[start_symbol]] 
+        # Initialize beams
+        candidates = [[start_symbol]]
         log_probs = [0]
         lengths = [0]
         
@@ -214,9 +221,9 @@ class Transformer(nn.Module):
             new_log_probs = []
             new_lengths = []
             
-            # 对每个候选序列计算log prob
+            # Compute log prob for each candidate sequence
             for i, candidate in enumerate(candidates):
-                last_token = candidate[-1]
+                last_token = torch.tensor([candidate[-1]], dtype=torch.long).unsqueeze(0)  # Adjusted dimension
                 embedding = self.tgt_embed(last_token)
                 output = self.decode(memory, src_mask, embedding, None)
                 log_prob = F.log_softmax(self.generator(output[:, -1]), dim=-1)
@@ -224,25 +231,25 @@ class Transformer(nn.Module):
                 # Beam Search
                 top_log_probs, indices = log_prob.topk(beam_size)
                 for j in range(beam_size):
-                    new_candidate = candidate + [indices[j].item()]
-                    new_log_prob = log_probs[i] + top_log_probs[j]
+                    new_candidate = candidate + [indices[0][j].item()]
+                    new_log_prob = log_probs[i] + top_log_probs[0][j]
                     new_length = lengths[i] + 1
                     
                     new_candidates.append(new_candidate)
-                    new_log_probs.append(new_log_prob)
+                    new_log_probs.append(new_log_prob.item())
                     new_lengths.append(new_length)
                     
-            # 添加长度惩罚
+            # Add length penalty
             for i, (new_log_prob, new_len) in enumerate(zip(new_log_probs, new_lengths)):
                 new_log_prob /= (new_len + 1) ** beta
                 new_log_probs[i] = new_log_prob
                 
-            # 按新分数排序    
+            # Sort by new scores
             ordered = sorted(zip(new_candidates, new_log_probs), 
-                            key=lambda x: x[1]/ (len(x[0])**alpha), 
-                            reverse=True)
-                            
-            # 取top beam_size个
+                             key=lambda x: x[1] / (len(x[0]) ** alpha), 
+                             reverse=True)
+                             
+            # Take top beam_size
             candidates = [x[0] for x in ordered[:beam_size]]
             log_probs = [x[1] for x in ordered[:beam_size]]
             lengths = [len(x[0]) for x in ordered[:beam_size]]
@@ -253,8 +260,8 @@ def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0
 
     # 创建组件
     c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model, dropout)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    attn = MultiHeadAttention(h, d_model, dropout)
+    ff = PositionalEncoding(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
     
     # 构建Encoder和Decoder
@@ -278,13 +285,14 @@ def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0
     # 参数初始化
     for name, p in model.named_parameters():
         if "lstm" in name:
-             if "weight" in name:
-                 nn.init.orthogonal_(p)
-             elif "bias" in name:
-                 nn.init.zeros_(p)
-        else:
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+            if "weight" in name:
+                nn.init.orthogonal_(p)
+            elif "bias" in name:
+                # Setting forget gate bias to 1 for LSTM
+                n = p.size(0)
+                start, end = n // 4, n // 2
+                p.data.fill_(0.)
+                p.data[start:end].fill_(1.)
                 
     return model
 
