@@ -5,12 +5,15 @@ import torch.nn.functional as F
 from torch.nn.modules import ModuleList
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from torch.optim import Adam 
+from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 
 # 添加warmup scheduler
 from torch.optim.lr_scheduler import LambdaLR
+
+# 添加Beam Search
+import torch.nn.functional as F
 
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
@@ -175,7 +178,41 @@ class Transformer(nn.Module):
     
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
-
+    
+    # 添加Beam Search
+    def beam_search(self, src, src_mask, max_len, start_symbol, beam_size=5):
+        memory = self.encode(src, src_mask)
+        
+        # 初始化beam
+        candidates = [[start_symbol]]
+        log_probs = [0]
+        
+        for step in range(max_len):
+            new_candidates = []
+            new_log_probs = []
+            
+            # 对每个候选序列计算log prob
+            for i, candidate in enumerate(candidates):
+                last_token = candidate[-1]
+                embedding = self.tgt_embed(last_token)
+                output = self.decode(memory, src_mask, embedding, None)
+                log_prob = F.log_softmax(self.generator(output[:, -1]), dim=-1)
+                
+                # Beam Search
+                top_log_probs, indices = log_prob.topk(beam_size)
+                for new_log_prob, new_index in zip(top_log_probs, indices):
+                    new_candidate = candidate + [new_index.item()]
+                    new_log_prob = log_probs[i] + new_log_prob
+                    new_candidates.append(new_candidate)
+                    new_log_probs.append(new_log_prob)
+            
+            # 保留beam_size个最优候选
+            ordered = sorted(zip(new_candidates, new_log_probs), key=lambda x: x[1], reverse=True)
+            candidates = [x[0] for x in ordered[:beam_size]]
+            log_probs = [x[1] for x in ordered[:beam_size]]
+            
+        return candidates, log_probs
+                
 def make_model(src_vocab, tgt_vocab, N=6, 
                d_model=512, d_ff=2048, h=8, dropout=0.1):
     c = copy.deepcopy
@@ -195,7 +232,7 @@ def make_model(src_vocab, tgt_vocab, N=6,
             nn.init.xavier_uniform_(p) 
     return model
 
-# 一个使用示例
+# 一个使用示例  
 if __name__ == '__main__':
     vocab_size = 1000
     emb_size = 512
@@ -246,3 +283,8 @@ if __name__ == '__main__':
 
         # 更新cosine annealing学习率
         scheduler.step()
+    
+    # Beam Search预测
+    src = ... # 源语言输入
+    src_mask = ... # 源语言 Attention Mask
+    candidates, log_probs = model.beam_search(src, src_mask, max_len=20, start_symbol=1, beam_size=5)
