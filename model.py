@@ -5,9 +5,12 @@ import torch.nn.functional as F
 from torch.nn.modules import ModuleList
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import Adam 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
+
+# 添加warmup scheduler
+from torch.optim.lr_scheduler import LambdaLR
 
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
@@ -104,7 +107,7 @@ class EncoderLayer(nn.Module):
         self.feed_forward = ResidualConnection(feed_forward, dropout)
 
     def forward(self, x, mask):
-        x = self.self_attn(x, x, x, mask) 
+        x = self.self_attn(x, x, x, mask)
         return self.feed_forward(x)
 
 class Encoder(nn.Module):
@@ -116,7 +119,7 @@ class Encoder(nn.Module):
     def forward(self, x, mask):
         for layer in self.layers:
             x = layer(x, mask)
-        return self.norm(x) 
+        return self.norm(x)
 
 class DecoderLayer(nn.Module):
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
@@ -186,11 +189,10 @@ def make_model(src_vocab, tgt_vocab, N=6,
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab))
     
-    # This was important from their code. 
-    # Initialize parameters with Glorot / fan_avg.
+    # 初始化参数
     for p in model.parameters():
         if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
+            nn.init.xavier_uniform_(p) 
     return model
 
 # 一个使用示例
@@ -199,18 +201,30 @@ if __name__ == '__main__':
     emb_size = 512
     N = 6
     epochs = 20
+    
     model = make_model(vocab_size, vocab_size, N=N, d_model=emb_size)
 
+    # 使用Adam优化器
     optimizer = Adam(model.parameters(), lr=0.0001)
+    
+    # 使用Cosine Annealing学习率衰减
     scheduler = CosineAnnealingLR(optimizer, epochs)
-    loss_fn = nn.NLLLoss()
+    
+    # 使用交叉熵损失
+    loss_fn = nn.NLLLoss() 
 
-    train_loader = DataLoader(train_data, batch_size=64) 
+    train_loader = DataLoader(train_data, batch_size=64)
 
-    device = torch.device('cuda') 
+    device = torch.device('cuda')
     model.to(device)
 
+    # 使用混合精度训练
     scaler = GradScaler()
+    
+    # 学习率warmup
+    warmup_steps = 4000
+    warmup_scheduler = LambdaLR(optimizer, linear_warmup_decay(warmup_steps, epochs*len(train_loader)))
+
     for epoch in range(epochs):
         for i, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
@@ -224,7 +238,11 @@ if __name__ == '__main__':
             scaler.step(optimizer)
             scaler.update()
 
+            # 更新warmup学习率
+            warmup_scheduler.step()
+
             if i%100 == 0:
                 print(f'Epoch {epoch} iteration {i}: loss {loss.item()}')
 
+        # 更新cosine annealing学习率
         scheduler.step()
